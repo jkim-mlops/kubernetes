@@ -38,8 +38,15 @@ func runGateway(cfg config) {
 	select {}
 }
 
-func handleInfer(w http.ResponseWriter, r *http.Request, cfg config, rdb *redis.Client) {
-	ctx := r.Context()
+func handleInfer(w http.ResponseWriter, _ *http.Request, cfg config, rdb *redis.Client) {
+	// Deliberately not r.Context(). A gateway that abandons its wait when the
+	// caller hangs up is better engineering in general, but here it would make
+	// the latency and timeout numbers every verify.sh is judged on depend on
+	// when a load generator happened to disconnect. The wait is bounded by
+	// REQUEST_TIMEOUT and by nothing else, which is what the scenarios assume.
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout+5*time.Second)
+	defer cancel()
+
 	start := time.Now()
 	metricRequests.Inc()
 	metricInflight.Inc()

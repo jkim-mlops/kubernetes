@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,9 +34,15 @@ func newRedisClient(addr string) *redis.Client {
 	})
 }
 
-// blockingPop wraps BLPOP/BRPOP. It returns ("", nil) when the block timeout
-// expires: a timeout is a normal outcome here, not a failure, and the gateway
-// reports it as 504 rather than 502.
+// blockingPop wraps BLPOP/BRPOP. It returns ("", nil) for exactly one
+// condition — the block timeout expired with nothing to pop — because that is
+// a normal outcome the gateway reports as 504.
+//
+// Nothing else may take that path. An earlier version also returned ("", nil)
+// when the command came back empty, which meant a cancelled request was
+// reported to the caller as "timed out waiting for a worker" after 900ms and
+// counted in mlsim_timeouts_total. A lab whose scenarios are judged on a
+// timeout count cannot afford a timeout that did not happen.
 func blockingPop(
 	ctx context.Context,
 	pop func(context.Context, time.Duration, ...string) *redis.StringSliceCmd,
@@ -44,12 +51,12 @@ func blockingPop(
 ) (string, error) {
 	vals, err := pop(ctx, timeout, key).Result()
 	switch {
-	case errors.Is(err, redis.Nil):
+	case errors.Is(err, redis.Nil): // the block timeout expired
 		return "", nil
 	case err != nil:
 		return "", err
-	case len(vals) < 2: // [key, value]
-		return "", nil
+	case len(vals) < 2: // BLPOP answers [key, value] or nothing at all
+		return "", fmt.Errorf("malformed pop reply for %s: %v", key, vals)
 	default:
 		return vals[1], nil
 	}
