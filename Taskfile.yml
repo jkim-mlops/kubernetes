@@ -3,7 +3,6 @@ version: '3'
 silent: true
 
 vars:
-  DEFAULT_MODULE: 01-scaling-beyond-hpa
   MLSIM_IMAGE: k8slab/mlsim:dev
   GPU_PLUGIN_IMAGE: k8slab/fake-gpu-device-plugin:dev
 
@@ -99,7 +98,7 @@ tasks:
 
   # -------------------------------------------------------------- cluster ---
   up:
-    desc: 'Create the lab cluster and install a module. Usage: task up -- <module>'
+    desc: 'Create the lab cluster and platform. Usage: task up [-- <module>]'
     cmds:
       - task: install
       - bin/lab up {{.CLI_ARGS}}

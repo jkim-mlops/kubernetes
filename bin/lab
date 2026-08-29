@@ -15,7 +15,6 @@ source "$LAB_ROOT/lib/guard.sh"
 # shellcheck source=../lib/wait.sh
 source "$LAB_ROOT/lib/wait.sh"
 
-DEFAULT_MODULE="01-scaling-beyond-hpa"
 MLSIM_IMAGE="k8slab/mlsim:dev"
 STATE_FILE="$LAB_ROOT/.lab/state"
 
@@ -34,6 +33,24 @@ state::set() {
   grep -v "^${key}=" "$STATE_FILE" > "$tmp" || true
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
   mv "$tmp" "$STATE_FILE"
+}
+
+# The module to act on when the caller names none: whichever one is active,
+# otherwise the first that exists. On a branch that carries no modules at all
+# (`main` carries setup only) this is empty, and that is a valid state — the
+# cluster and the platform components stand on their own.
+lab::default_module() {
+  local m
+  m="$(state::get MODULE)"
+  if [[ -n "$m" && -d "$LAB_ROOT/modules/$m" ]]; then
+    printf '%s\n' "$m"
+    return 0
+  fi
+  for m in "$LAB_ROOT"/modules/*/; do
+    [[ -d "$m" ]] || continue
+    basename "$m"
+    return 0
+  done
 }
 
 # Match a directory name exactly, or by unique prefix, so "01" stands in for
@@ -66,10 +83,12 @@ scenario::resolve() {
     module="${arg%%/*}"
     scenario="${arg#*/}"
   else
-    module="$(state::get MODULE)"
-    [[ -n "$module" ]] || module="$DEFAULT_MODULE"
+    module="$(lab::default_module)"
     scenario="$arg"
   fi
+
+  [[ -n "$module" ]] || log::die "This branch carries no modules — only the lab setup.
+       Check out a module branch (see: git branch -a) and try again."
 
   if ! resolved="$(scenario::match_dir "$LAB_ROOT/modules" "$module")"; then
     log::die "No such module: $module  (see 'task list')"
@@ -147,8 +166,14 @@ cmd_doctor() {
 
 # ------------------------------------------------------------------- up ----
 cmd_up() {
-  local module="${1:-$DEFAULT_MODULE}"
-  [[ -d "$LAB_ROOT/modules/$module" ]] || log::die "No such module: $module  (see 'task list')"
+  local module resolved
+  module="${1:-$(lab::default_module)}"
+  if [[ -n "$module" ]]; then
+    if ! resolved="$(scenario::match_dir "$LAB_ROOT/modules" "$module")"; then
+      log::die "No such module: $module  (see 'task list')"
+    fi
+    module="$resolved"
+  fi
   local cluster; cluster="$(guard::cluster_for_module "$module")"
 
   command -v kind >/dev/null 2>&1 || log::die "kind is not installed — run: task install"
@@ -194,8 +219,15 @@ cmd_up() {
     LAB_ROOT="$LAB_ROOT" bash "$LAB_ROOT/modules/$module/install.sh"
   fi
 
-  state::set MODULE "$module"
   echo
+  if [[ -z "$module" ]]; then
+    log::ok "Lab cluster $cluster is ready (setup only — no module on this branch)."
+    log::dim "next:  task doctor            # prove the isolation"
+    log::dim "       task k -- get pods -A  # kubectl, scoped to the lab"
+    return 0
+  fi
+
+  state::set MODULE "$module"
   log::ok "Module $module is ready."
   log::dim "next:  task list      # see the scenarios"
   log::dim "       task start -- $module/01"
@@ -215,8 +247,7 @@ cmd_down() {
     return 0
   fi
 
-  local module="${arg:-$(state::get MODULE)}"
-  module="${module:-$DEFAULT_MODULE}"
+  local module="${arg:-$(lab::default_module)}"
   local cluster; cluster="$(guard::cluster_for_module "$module")"
   if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
     log::step "Deleting cluster $cluster"
@@ -236,6 +267,13 @@ cmd_list() {
   local active_module active_scenario
   active_module="$(state::get MODULE)"
   active_scenario="$(state::get SCENARIO)"
+
+  if ! compgen -G "$LAB_ROOT/modules/*/" >/dev/null; then
+    echo
+    log::dim "No modules on this branch — it carries the lab setup only."
+    log::dim "Module content lives on its own branch:  git branch -a"
+    return 0
+  fi
 
   local m s title marker
   for m in "$LAB_ROOT"/modules/*/; do
@@ -337,13 +375,19 @@ cmd_reset() {
 # its fix and PASS after it.
 cmd_test() {
   guard::require_lab_context
-  local module="${1:-$(state::get MODULE)}"
-  module="${module:-$DEFAULT_MODULE}"
-  local failures=0 s
+  local module resolved
+  module="${1:-$(lab::default_module)}"
+  [[ -n "$module" ]] || log::die "This branch carries no modules, so there is nothing to test."
+  if ! resolved="$(scenario::match_dir "$LAB_ROOT/modules" "$module")"; then
+    log::die "No such module: $module  (see 'task list')"
+  fi
+  module="$resolved"
+  local failures=0 tested=0 s
 
   for s in "$LAB_ROOT/modules/$module"/scenarios/*/; do
     [[ -d "$s" ]] || continue
     s="$(basename "$s")"
+    tested=$(( tested + 1 ))
     log::step "test: $module/$s"
 
     cmd_start "$module/$s" >/dev/null
@@ -365,8 +409,9 @@ cmd_test() {
   done
 
   echo
+  (( tested > 0 )) || log::die "module $module has no scenarios"
   if (( failures == 0 )); then
-    log::verdict_pass "all scenarios in $module behave correctly"
+    log::verdict_pass "all $tested scenario(s) in $module behave correctly"
   else
     log::verdict_fail "$failures scenario(s) in $module are broken"
     exit 1
@@ -379,7 +424,7 @@ usage() {
 lab — Kubernetes Capability Lab
 
   lab doctor                     check prerequisites and isolation
-  lab up [module]                create the cluster and install a module
+  lab up [module]                create the cluster, the platform, and a module if there is one
   lab down [module|--all]        delete the cluster
   lab list                       list modules and scenarios
   lab start <module>/<scenario>  apply the base state and inject the fault

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // The worker pops jobs off the queue and simulates inference: a fixed think
@@ -34,7 +37,7 @@ func runWorker(cfg config) {
 	if cfg.GPUMemMB > 0 {
 		log.Printf("model resident on GPU (%d MB simulated)", cfg.GPUMemMB)
 	}
-	metricModelLoad.Store(int64(cfg.ModelLoadSeconds))
+	metricModelLoad.Set(cfg.ModelLoadSeconds)
 	ready.Store(true)
 	log.Printf("worker ready — queue=%s latency=%dms concurrency=%d",
 		cfg.Queue, cfg.LatencyMS, envInt("CONCURRENCY", 1))
@@ -43,23 +46,27 @@ func runWorker(cfg config) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	// One client, shared: go-redis pools connections internally, so each
+	// consumer goroutine borrows one for the length of its blocking read.
+	rdb := newRedisClient(cfg.RedisAddr)
+
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consume(cfg)
+			consume(cfg, rdb)
 		}()
 	}
 	wg.Wait()
 }
 
-func consume(cfg config) {
-	pool := newRedisPool(cfg.RedisAddr)
+func consume(cfg config, rdb *redis.Client) {
+	ctx := context.Background()
 	for {
 		// A short block timeout keeps the worker responsive to shutdown and
 		// lets it notice a Redis restart quickly.
-		job, err := pool.BPop("BRPOP", cfg.Queue, 5*time.Second)
+		job, err := blockingPop(ctx, rdb.BRPop, cfg.Queue, 5*time.Second)
 		if err != nil {
 			log.Printf("queue read failed: %v", err)
 			time.Sleep(time.Second)
@@ -68,14 +75,14 @@ func consume(cfg config) {
 		if job == "" {
 			continue // idle
 		}
-		process(cfg, pool, job)
+		process(ctx, cfg, rdb, job)
 	}
 }
 
-func process(cfg config, pool *redisPool, job string) {
-	metricRequests.Add(1)
-	metricInflight.Add(1)
-	defer metricInflight.Add(-1)
+func process(ctx context.Context, cfg config, rdb *redis.Client, job string) {
+	metricRequests.Inc()
+	metricInflight.Inc()
+	defer metricInflight.Dec()
 
 	id := job
 	if i := strings.IndexByte(job, '|'); i >= 0 {
@@ -106,9 +113,9 @@ func process(cfg config, pool *redisPool, job string) {
 	reply := "ok"
 	if cfg.ErrorRate > 0 && rand.Float64() < cfg.ErrorRate {
 		reply = "error"
-		metricErrors.Add(1)
+		metricErrors.Inc()
 	}
-	if err := pool.PushReply("reply:"+id, reply, 60*time.Second); err != nil {
+	if err := pushReply(ctx, rdb, "reply:"+id, reply, 60*time.Second); err != nil {
 		log.Printf("reply for %s failed: %v", id, err)
 	}
 }

@@ -1,39 +1,59 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
-	"sync/atomic"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// A hand-rolled Prometheus text endpoint. Four counters and two gauges do not
-// justify a dependency, and the exposition format is stable.
+// Metrics go through client_golang rather than a hand-printed exposition
+// format. The reason is not tidiness: a histogram is a real metric type with
+// real quantiles, and the scenarios that scale on latency — KEDA's Prometheus
+// scaler, a custom-metrics adapter — need one. Registering with the default
+// registry also brings the go_* and process_* collectors along, which is how
+// the memory scenarios show RSS climbing towards the limit before the OOMKill.
+
 var (
-	metricRequests  atomic.Int64
-	metricErrors    atomic.Int64
-	metricTimeouts  atomic.Int64
-	metricInflight  atomic.Int64
-	metricQueueDeep atomic.Int64
-	metricModelLoad atomic.Int64 // seconds spent loading the model
+	metricRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mlsim_requests_total",
+		Help: "Inference requests handled.",
+	})
+	metricErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mlsim_errors_total",
+		Help: "Inference requests that failed.",
+	})
+	metricTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mlsim_timeouts_total",
+		Help: "Requests that gave up waiting for a worker.",
+	})
+	metricInflight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mlsim_inflight",
+		Help: "Requests currently in flight.",
+	})
+	metricQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mlsim_queue_depth",
+		Help: "Last observed depth of the inference queue.",
+	})
+	metricModelLoad = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mlsim_model_load_seconds",
+		Help: "Time the model took to load.",
+	})
+
+	// Queue wait is included on purpose: this is what a caller experiences,
+	// and the gap between it and LATENCY_MS is the backlog. Buckets run from
+	// 50ms to ~25s, which spans a healthy response and a gateway timeout.
+	metricRequestSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "mlsim_request_duration_seconds",
+		Help:    "End-to-end latency of an inference request, queue wait included.",
+		Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+	})
+
+	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "mlsim_ready",
+		Help: "1 when the model is loaded and serving.",
+	}, func() float64 {
+		if ready.Load() {
+			return 1
+		}
+		return 0
+	})
 )
-
-func handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-
-	emit := func(name, typ, help string, value int64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, typ, name, value)
-	}
-
-	emit("mlsim_requests_total", "counter", "Inference requests handled.", metricRequests.Load())
-	emit("mlsim_errors_total", "counter", "Inference requests that failed.", metricErrors.Load())
-	emit("mlsim_timeouts_total", "counter", "Requests that gave up waiting for a worker.", metricTimeouts.Load())
-	emit("mlsim_inflight", "gauge", "Requests currently in flight.", metricInflight.Load())
-	emit("mlsim_queue_depth", "gauge", "Last observed depth of the inference queue.", metricQueueDeep.Load())
-	emit("mlsim_model_load_seconds", "gauge", "Time the model took to load.", metricModelLoad.Load())
-
-	var readyVal int64
-	if ready.Load() {
-		readyVal = 1
-	}
-	emit("mlsim_ready", "gauge", "1 when the model is loaded and serving.", readyVal)
-}
