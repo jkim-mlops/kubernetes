@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+#
+# lab — the Kubernetes Capability Lab CLI.
+#
+# You normally reach this through the Taskfile (`task up`, `task verify`, ...),
+# but every command works standalone too.
+set -euo pipefail
+
+LAB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export LAB_ROOT
+# shellcheck source=../lib/log.sh
+source "$LAB_ROOT/lib/log.sh"
+# shellcheck source=../lib/guard.sh
+source "$LAB_ROOT/lib/guard.sh"
+# shellcheck source=../lib/wait.sh
+source "$LAB_ROOT/lib/wait.sh"
+
+DEFAULT_MODULE="01-scaling-beyond-hpa"
+MLSIM_IMAGE="k8slab/mlsim:dev"
+STATE_FILE="$LAB_ROOT/.lab/state"
+
+# ----------------------------------------------------------------- state ---
+state::get() {
+  local key="$1"
+  [[ -f "$STATE_FILE" ]] || return 0
+  sed -n "s/^${key}=//p" "$STATE_FILE" | tail -1
+}
+
+state::set() {
+  local key="$1" value="$2" tmp
+  mkdir -p "$(dirname "$STATE_FILE")"
+  touch "$STATE_FILE"
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "$STATE_FILE" > "$tmp" || true
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+# Match a directory name exactly, or by unique prefix, so "01" stands in for
+# "01-hpa-is-blind-to-the-queue". Prints the resolved name, or fails.
+scenario::match_dir() {
+  local parent="$1" name="$2" match
+  if [[ -n "$name" && -d "$parent/$name" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  [[ -n "$name" && -d "$parent" ]] || return 1
+  match="$(cd "$parent" && ls -d "${name}"*/ 2>/dev/null | head -1)" || true
+  [[ -n "$match" ]] || return 1
+  printf '%s\n' "${match%/}"
+}
+
+# Resolve "<module>/<scenario>", or a bare scenario within the active module,
+# or nothing at all (meaning: whatever scenario is currently active). Both
+# halves accept the numeric prefix as shorthand: "01/01" works.
+scenario::resolve() {
+  local arg="${1:-}" module scenario resolved
+
+  if [[ -z "$arg" ]]; then
+    module="$(state::get MODULE)"
+    scenario="$(state::get SCENARIO)"
+    [[ -n "$scenario" ]] || log::die "No scenario is active. Start one with:
+       task start -- <module>/<scenario>
+       (see 'task list')"
+  elif [[ "$arg" == */* ]]; then
+    module="${arg%%/*}"
+    scenario="${arg#*/}"
+  else
+    module="$(state::get MODULE)"
+    [[ -n "$module" ]] || module="$DEFAULT_MODULE"
+    scenario="$arg"
+  fi
+
+  if ! resolved="$(scenario::match_dir "$LAB_ROOT/modules" "$module")"; then
+    log::die "No such module: $module  (see 'task list')"
+  fi
+  module="$resolved"
+
+  local dir="$LAB_ROOT/modules/$module/scenarios"
+  if ! resolved="$(scenario::match_dir "$dir" "$scenario")"; then
+    log::die "No such scenario: $module/$scenario  (see 'task list')"
+  fi
+  scenario="$resolved"
+
+  SCENARIO_MODULE="$module"
+  SCENARIO_NAME="$scenario"
+  SCENARIO_DIR="$dir/$scenario"
+}
+
+scenario::run_script() {
+  local script="$SCENARIO_DIR/$1"
+  [[ -f "$script" ]] || log::die "Scenario $SCENARIO_MODULE/$SCENARIO_NAME has no $1"
+  LAB_ROOT="$LAB_ROOT" SCENARIO_DIR="$SCENARIO_DIR" bash "$script"
+}
+
+# ---------------------------------------------------------------- doctor ---
+cmd_doctor() {
+  log::step "Prerequisites"
+  local missing=0
+  _check() {
+    local bin="$1" version_cmd="$2"
+    if command -v "$bin" >/dev/null 2>&1; then
+      log::ok "$(printf '%-10s %s' "$bin" "$(eval "$version_cmd" 2>/dev/null | head -1)")"
+    else
+      log::fail "$(printf '%-10s not installed — run: task install' "$bin")"
+      missing=1
+    fi
+  }
+  _check docker  "docker --version"
+  _check kubectl "kubectl version --client -o yaml | sed -n 's/  gitVersion: //p' | head -1"
+  _check kind    "kind --version"
+  _check helm    "helm version --short"
+  _check go      "go version"
+
+  if docker info >/dev/null 2>&1; then
+    log::ok "docker daemon reachable"
+  else
+    log::fail "docker daemon not reachable — start Docker Desktop"
+    missing=1
+  fi
+
+  log::step "Isolation"
+  log::info "lab KUBECONFIG   $KUBECONFIG"
+  local lab_ctx your_ctx
+  lab_ctx="$(guard::current_context)"
+  your_ctx="$(KUBECONFIG="${HOME}/.kube/config" kubectl config current-context 2>/dev/null || echo '(none)')"
+  log::info "lab context      ${lab_ctx:-(no cluster yet — run: task up)}"
+  log::info "your context     $your_ctx"
+  if [[ -n "$lab_ctx" && "$lab_ctx" != "$LAB_CONTEXT_PREFIX"* ]]; then
+    log::fail "lab context is not a kind lab cluster"
+    missing=1
+  else
+    log::ok "your own kubectl context is untouched by this lab"
+  fi
+
+  log::step "Cluster"
+  if [[ -n "$lab_ctx" ]] && kubectl get nodes >/dev/null 2>&1; then
+    kubectl get nodes -o wide | sed 's/^/    /'
+  else
+    log::dim "not running — 'task up' to create it"
+  fi
+
+  echo
+  (( missing == 0 )) || log::die "some prerequisites are missing"
+  log::ok "all good"
+}
+
+# ------------------------------------------------------------------- up ----
+cmd_up() {
+  local module="${1:-$DEFAULT_MODULE}"
+  [[ -d "$LAB_ROOT/modules/$module" ]] || log::die "No such module: $module  (see 'task list')"
+  local cluster; cluster="$(guard::cluster_for_module "$module")"
+
+  command -v kind >/dev/null 2>&1 || log::die "kind is not installed — run: task install"
+
+  if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
+    log::step "Cluster $cluster already exists"
+  else
+    log::step "Creating cluster $cluster (1 control-plane + 2 workers)"
+    kind create cluster \
+      --name "$cluster" \
+      --config "$LAB_ROOT/clusters/base.yaml" \
+      --kubeconfig "$LAB_KUBECONFIG" \
+      --wait 120s
+  fi
+
+  kubectl config use-context "kind-$cluster" >/dev/null
+  guard::require_lab_context
+  export LAB_CLUSTER="$cluster"
+
+  log::step "Labelling worker nodes"
+  local workers
+  workers="$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name)"
+  [[ -n "$workers" ]] || log::die "cluster has no worker nodes"
+  # shellcheck disable=SC2086
+  kubectl label $workers k8slab.io/gpu=true --overwrite >/dev/null
+  log::ok "$(wc -l <<<"$workers" | tr -d ' ') workers labelled k8slab.io/gpu=true"
+
+  if [[ -n "$(docker images -q "$MLSIM_IMAGE" 2>/dev/null)" ]]; then
+    log::step "Loading $MLSIM_IMAGE into the cluster"
+    kind load docker-image "$MLSIM_IMAGE" --name "$cluster"
+  fi
+
+  log::step "Installing platform components"
+  local p
+  for p in "$LAB_ROOT"/platform/*/install.sh; do
+    [[ -f "$p" ]] || continue
+    log::info "$(basename "$(dirname "$p")")"
+    LAB_ROOT="$LAB_ROOT" bash "$p"
+  done
+
+  if [[ -f "$LAB_ROOT/modules/$module/install.sh" ]]; then
+    log::step "Installing module $module"
+    LAB_ROOT="$LAB_ROOT" bash "$LAB_ROOT/modules/$module/install.sh"
+  fi
+
+  state::set MODULE "$module"
+  echo
+  log::ok "Module $module is ready."
+  log::dim "next:  task list      # see the scenarios"
+  log::dim "       task start -- $module/01"
+}
+
+cmd_down() {
+  local arg="${1:-}"
+  command -v kind >/dev/null 2>&1 || { log::dim "kind not installed; nothing to delete"; return 0; }
+
+  if [[ "$arg" == "--all" ]]; then
+    local c
+    for c in $(kind get clusters 2>/dev/null | grep "^$LAB_CLUSTER_PREFIX" || true); do
+      log::step "Deleting cluster $c"
+      kind delete cluster --name "$c" --kubeconfig "$LAB_KUBECONFIG"
+    done
+    rm -f "$STATE_FILE"
+    return 0
+  fi
+
+  local module="${arg:-$(state::get MODULE)}"
+  module="${module:-$DEFAULT_MODULE}"
+  local cluster; cluster="$(guard::cluster_for_module "$module")"
+  if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
+    log::step "Deleting cluster $cluster"
+    kind delete cluster --name "$cluster" --kubeconfig "$LAB_KUBECONFIG"
+  else
+    log::dim "cluster $cluster is not running"
+  fi
+  rm -f "$STATE_FILE"
+}
+
+cmd_env() {
+  echo "export KUBECONFIG=$LAB_KUBECONFIG"
+}
+
+# ----------------------------------------------------------------- list ----
+cmd_list() {
+  local active_module active_scenario
+  active_module="$(state::get MODULE)"
+  active_scenario="$(state::get SCENARIO)"
+
+  local m s title marker
+  for m in "$LAB_ROOT"/modules/*/; do
+    [[ -d "$m" ]] || continue
+    m="$(basename "$m")"
+    title="$(sed -n '1s/^#\{1,\} *//p' "$LAB_ROOT/modules/$m/README.md" 2>/dev/null)" || true
+    printf '\n%s%s%s  %s%s%s\n' "$_C_BOLD" "$m" "$_C_RESET" "$_C_DIM" "${title:-}" "$_C_RESET"
+    for s in "$LAB_ROOT/modules/$m"/scenarios/*/; do
+      [[ -d "$s" ]] || continue
+      s="$(basename "$s")"
+      title="$(sed -n '1s/^#\{1,\} *//p' "$LAB_ROOT/modules/$m/scenarios/$s/README.md" 2>/dev/null)" || true
+      marker="  "
+      [[ "$m" == "$active_module" && "$s" == "$active_scenario" ]] && marker="${_C_GREEN}▸ ${_C_RESET}"
+      printf '  %s%-34s %s%s%s\n' "$marker" "$s" "$_C_DIM" "${title:-}" "$_C_RESET"
+    done
+  done
+  echo
+  log::dim "start one:  task start -- <module>/<scenario>"
+}
+
+# ------------------------------------------------------------- scenarios ---
+cmd_start() {
+  guard::require_lab_context
+  scenario::resolve "${1:-}"
+  log::step "Starting $SCENARIO_MODULE/$SCENARIO_NAME"
+
+  if [[ -d "$SCENARIO_DIR/manifests" ]]; then
+    kubectl apply -f "$SCENARIO_DIR/manifests" >/dev/null
+  fi
+  scenario::run_script break.sh
+
+  state::set MODULE "$SCENARIO_MODULE"
+  state::set SCENARIO "$SCENARIO_NAME"
+  state::set HINT 0
+
+  echo
+  sed 's/^/  /' "$SCENARIO_DIR/README.md"
+  echo
+  log::dim "when you think it's fixed:  task verify"
+  log::dim "stuck:                      task hint"
+}
+
+cmd_verify() {
+  guard::require_lab_context
+  scenario::resolve "${1:-}"
+  log::step "Verifying $SCENARIO_MODULE/$SCENARIO_NAME"
+  scenario::run_script verify.sh
+}
+
+cmd_hint() {
+  scenario::resolve ""
+  local want="${1:-}" current
+  current="$(state::get HINT)"; current="${current:-0}"
+  [[ -n "$want" ]] || want=$(( current + 1 ))
+
+  local file="$SCENARIO_DIR/hints.md"
+  [[ -f "$file" ]] || log::die "no hints for this scenario"
+
+  local total
+  total="$(grep -c '^## ' "$file" || true)"
+  (( want <= total )) || log::die "there are only $total hints — try 'task solve'"
+
+  awk -v n="$want" '
+    /^## /{ c++ }
+    c==n { print }
+  ' "$file" | sed 's/^/  /'
+  state::set HINT "$want"
+  echo
+  log::dim "hint $want of $total   (next: task hint)"
+}
+
+cmd_solve() {
+  scenario::resolve "${1:-}"
+  sed 's/^/  /' "$SCENARIO_DIR/SOLUTION.md"
+}
+
+cmd_fix() {
+  guard::require_lab_context
+  scenario::resolve "${1:-}"
+  log::step "Applying the shipped fix for $SCENARIO_MODULE/$SCENARIO_NAME"
+  scenario::run_script fix.sh
+  log::ok "fix applied — run 'task verify' to confirm"
+}
+
+cmd_reset() {
+  guard::require_lab_context
+  scenario::resolve "${1:-}"
+  log::step "Resetting $SCENARIO_MODULE/$SCENARIO_NAME to its broken baseline"
+  if [[ -f "$SCENARIO_DIR/reset.sh" ]]; then
+    scenario::run_script reset.sh
+  elif [[ -d "$SCENARIO_DIR/manifests" ]]; then
+    kubectl delete -f "$SCENARIO_DIR/manifests" --ignore-not-found >/dev/null
+  fi
+  cmd_start "$SCENARIO_MODULE/$SCENARIO_NAME"
+}
+
+# ----------------------------------------------------------------- test ----
+# Proves the shipped solutions actually work: each scenario must FAIL before
+# its fix and PASS after it.
+cmd_test() {
+  guard::require_lab_context
+  local module="${1:-$(state::get MODULE)}"
+  module="${module:-$DEFAULT_MODULE}"
+  local failures=0 s
+
+  for s in "$LAB_ROOT/modules/$module"/scenarios/*/; do
+    [[ -d "$s" ]] || continue
+    s="$(basename "$s")"
+    log::step "test: $module/$s"
+
+    cmd_start "$module/$s" >/dev/null
+
+    if cmd_verify "$module/$s" >/dev/null 2>&1; then
+      log::fail "verify PASSED before the fix — the scenario is not actually broken"
+      failures=$(( failures + 1 ))
+      continue
+    fi
+    log::ok "fails before the fix, as expected"
+
+    cmd_fix "$module/$s" >/dev/null
+    if cmd_verify "$module/$s" >/dev/null 2>&1; then
+      log::ok "passes after the fix"
+    else
+      log::fail "verify FAILED after applying fix.sh — the shipped solution is wrong"
+      failures=$(( failures + 1 ))
+    fi
+  done
+
+  echo
+  if (( failures == 0 )); then
+    log::verdict_pass "all scenarios in $module behave correctly"
+  else
+    log::verdict_fail "$failures scenario(s) in $module are broken"
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------- main ----
+usage() {
+  cat <<'USAGE'
+lab — Kubernetes Capability Lab
+
+  lab doctor                     check prerequisites and isolation
+  lab up [module]                create the cluster and install a module
+  lab down [module|--all]        delete the cluster
+  lab list                       list modules and scenarios
+  lab start <module>/<scenario>  apply the base state and inject the fault
+  lab verify                     objective pass/fail for the active scenario
+  lab hint [n]                   reveal the next hint
+  lab solve                      show the full solution write-up
+  lab fix                        apply the shipped fix (escape hatch)
+  lab reset                      back to the broken baseline
+  lab test [module]              regression suite over every scenario
+  lab env                        print the KUBECONFIG export
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    doctor) cmd_doctor "$@" ;;
+    up)     cmd_up "$@" ;;
+    down)   cmd_down "$@" ;;
+    list)   cmd_list "$@" ;;
+    start)  cmd_start "$@" ;;
+    verify) cmd_verify "$@" ;;
+    hint)   cmd_hint "$@" ;;
+    solve)  cmd_solve "$@" ;;
+    fix)    cmd_fix "$@" ;;
+    reset)  cmd_reset "$@" ;;
+    test)   cmd_test "$@" ;;
+    env)    cmd_env "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; log::die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

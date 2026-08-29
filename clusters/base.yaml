@@ -1,0 +1,11 @@
+# Shared kind topology for every lab module.
+# The cluster name is supplied by `kind create cluster --name`, so this one
+# config serves all modules. Node labels are applied after creation by
+# bin/lab (kubeadm's kubeletExtraArgs schema changed in v1beta4, and doing it
+# with `kubectl label` keeps this working across Kubernetes versions).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

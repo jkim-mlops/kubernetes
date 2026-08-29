@@ -1,0 +1,170 @@
+version: '3'
+
+silent: true
+
+vars:
+  DEFAULT_MODULE: 01-scaling-beyond-hpa
+  MLSIM_IMAGE: k8slab/mlsim:dev
+  GPU_PLUGIN_IMAGE: k8slab/fake-gpu-device-plugin:dev
+
+# Every task runs against the lab's own kubeconfig. The user's ~/.kube/config
+# (which points at a real EKS cluster) is never read or written.
+env:
+  KUBECONFIG: '{{.ROOT_DIR}}/.lab/kubeconfig'
+  LAB_ROOT: '{{.ROOT_DIR}}'
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # ---------------------------------------------------------------- setup ---
+  install:
+    desc: Install every prerequisite and build the lab images (idempotent)
+    cmds:
+      - task: check:brew
+      - task: brew:install
+        vars: {FORMULA: kind, BIN: kind}
+      - task: brew:install
+        vars: {FORMULA: helm, BIN: helm}
+      - task: brew:install
+        vars: {FORMULA: kubernetes-cli, BIN: kubectl}
+      - task: brew:install
+        vars: {FORMULA: go, BIN: go}
+      - task: check:docker
+      - task: build:mlsim
+      - task: build:gpu-plugin
+      - echo ""
+      - 'echo "  Setup complete. Next -> task up"'
+
+  check:brew:
+    internal: true
+    cmds:
+      - |
+        command -v brew >/dev/null 2>&1 || {
+          echo "ERROR: Homebrew is required. Install it from https://brew.sh" >&2
+          exit 1
+        }
+
+  brew:install:
+    internal: true
+    label: 'install:{{.FORMULA}}'
+    status:
+      - command -v {{.BIN}} >/dev/null 2>&1
+    cmds:
+      - 'echo "  installing {{.FORMULA}} ..."'
+      - brew install {{.FORMULA}}
+
+  check:docker:
+    internal: true
+    cmds:
+      - |
+        docker info >/dev/null 2>&1 || {
+          echo "ERROR: Docker is not running. Start Docker Desktop and re-run 'task install'." >&2
+          exit 1
+        }
+        echo "  docker            ok"
+
+  build:mlsim:
+    desc: Build the mlsim workload image
+    sources:
+      - apps/mlsim/**/*
+    generates:
+      - .lab/.mlsim-image-id
+    cmds:
+      - 'echo "  building {{.MLSIM_IMAGE}} ..."'
+      - docker build -q -t {{.MLSIM_IMAGE}} apps/mlsim
+      - mkdir -p .lab
+      - docker images --no-trunc -q {{.MLSIM_IMAGE}} > .lab/.mlsim-image-id
+
+  build:gpu-plugin:
+    desc: Build the fake GPU device plugin image
+    sources:
+      - platform/fake-gpu-device-plugin/*.go
+      - platform/fake-gpu-device-plugin/go.*
+      - platform/fake-gpu-device-plugin/Dockerfile
+    generates:
+      - .lab/.gpu-plugin-image-id
+    cmds:
+      - 'echo "  building {{.GPU_PLUGIN_IMAGE}} ..."'
+      - docker build -q -t {{.GPU_PLUGIN_IMAGE}} platform/fake-gpu-device-plugin
+      - mkdir -p .lab
+      - docker images --no-trunc -q {{.GPU_PLUGIN_IMAGE}} > .lab/.gpu-plugin-image-id
+
+  doctor:
+    desc: Report prerequisite versions and confirm the lab is isolated from your real clusters
+    cmds:
+      - bin/lab doctor
+
+  # -------------------------------------------------------------- cluster ---
+  up:
+    desc: 'Create the lab cluster and install a module. Usage: task up -- <module>'
+    cmds:
+      - task: install
+      - bin/lab up {{.CLI_ARGS}}
+
+  down:
+    desc: Delete the lab cluster
+    cmds:
+      - bin/lab down {{.CLI_ARGS}}
+
+  clean:
+    desc: Delete the cluster, built images and all local lab state
+    cmds:
+      - bin/lab down --all
+      - docker rmi -f {{.MLSIM_IMAGE}} {{.GPU_PLUGIN_IMAGE}} 2>/dev/null || true
+      - rm -rf .lab
+      - echo "  cleaned"
+
+  # ------------------------------------------------------------- scenarios ---
+  list:
+    desc: List modules and scenarios
+    cmds:
+      - bin/lab list
+
+  start:
+    desc: 'Start a scenario. Usage: task start -- <module>/<scenario>'
+    cmds:
+      - bin/lab start {{.CLI_ARGS}}
+
+  verify:
+    desc: Check whether the current scenario is fixed (objective pass/fail)
+    cmds:
+      - bin/lab verify {{.CLI_ARGS}}
+
+  hint:
+    desc: 'Reveal the next hint. Usage: task hint  (or: task hint -- 3)'
+    cmds:
+      - bin/lab hint {{.CLI_ARGS}}
+
+  solve:
+    desc: Show the full solution write-up for the current scenario
+    cmds:
+      - bin/lab solve {{.CLI_ARGS}}
+
+  fix:
+    desc: Apply the shipped fix for the current scenario (escape hatch)
+    cmds:
+      - bin/lab fix {{.CLI_ARGS}}
+
+  reset:
+    desc: Reset the current scenario back to its broken baseline
+    cmds:
+      - bin/lab reset {{.CLI_ARGS}}
+
+  # ------------------------------------------------------------------ misc ---
+  k:
+    desc: 'kubectl against the lab cluster. Usage: task k -- get pods -A'
+    cmds:
+      - kubectl {{.CLI_ARGS}}
+
+  env:
+    desc: Print the shell export needed to use kubectl directly against the lab
+    cmds:
+      - bin/lab env
+
+  test:
+    desc: Regression suite - every scenario must fail before its fix and pass after
+    cmds:
+      - bin/lab test {{.CLI_ARGS}}
