@@ -1,0 +1,29 @@
+# The fix: scale on the depth of the queue, which is where the problem actually
+# shows up, instead of on CPU, which never moves.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  # pollingInterval and cooldownPeriod belong here too, but KEDA ignores them
+  # while minReplicaCount is above zero -- it warns you as much on apply. They
+  # start mattering in scenario 02, where this drops to 0.
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        # Target one queued item per replica. KEDA divides the queue depth by
+        # this to get a replica count, so a backlog of 10 asks for 10 pods --
+        # roughly what 12 rps needs at 1.25 rps per pod. Raise it and you trade
+        # latency for fewer pods; the queue settles at listLength x replicas,
+        # and every item waiting is latency a user feels.
+        listLength: "1"
+        # Below this the workload is considered idle. It matters much more in
+        # the next scenario, where minReplicaCount drops to zero.
+        activationListLength: "0"

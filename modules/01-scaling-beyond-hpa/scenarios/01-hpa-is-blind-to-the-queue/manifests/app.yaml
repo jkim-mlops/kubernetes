@@ -1,0 +1,168 @@
+# The inference path: loadgen -> gateway -> redis queue -> model-worker.
+#
+# The gateway spends its life blocked on a Redis reply, and the worker spends
+# its life sleeping through a simulated GPU call. Neither burns much CPU, which
+# is the crux of this scenario.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference-gateway
+  template:
+    metadata:
+      labels:
+        app: inference-gateway
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: gateway
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            # Bounded so a backlog shows up as timeouts rather than as an
+            # ever-growing pile of open connections.
+            - name: REQUEST_TIMEOUT
+              value: 20s
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  selector:
+    app: inference-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-worker
+  template:
+    metadata:
+      labels:
+        app: model-worker
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: worker
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            # 800 ms per inference, one at a time: 1.25 requests per second
+            # per pod. Worth remembering when you work out how many you need.
+            - name: LATENCY_MS
+              value: "800"
+            - name: CONCURRENCY
+              value: "1"
+            - name: CPU_BURN_MS
+              value: "15"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-worker
+  minReplicas: 1
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# Steady production traffic, so the system is under load while you investigate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: loadgen
+            - name: TARGET_URL
+              value: http://inference-gateway.ml.svc.cluster.local:8080/infer
+            - name: RPS
+              value: "12"
+            - name: DURATION
+              value: 24h
+            - name: REQUEST_TIMEOUT
+              value: 30s
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
