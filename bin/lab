@@ -375,8 +375,13 @@ cmd_reset() {
 # its fix and PASS after it.
 cmd_test() {
   guard::require_lab_context
-  local module="${1:-$(lab::default_module)}"
+  local module resolved
+  module="${1:-$(lab::default_module)}"
   [[ -n "$module" ]] || log::die "This branch carries no modules, so there is nothing to test."
+  if ! resolved="$(scenario::match_dir "$LAB_ROOT/modules" "$module")"; then
+    log::die "No such module: $module  (see 'task list')"
+  fi
+  module="$resolved"
   local failures=0 tested=0 s
 
   for s in "$LAB_ROOT/modules/$module"/scenarios/*/; do
