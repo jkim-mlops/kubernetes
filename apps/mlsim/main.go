@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type config struct {
@@ -121,7 +123,7 @@ func serveHTTP(addr string, extra func(*http.ServeMux)) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ready")
 	})
-	mux.HandleFunc("/metrics", handleMetrics)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	if extra != nil {
 		extra(mux)

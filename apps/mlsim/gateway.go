@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // The gateway accepts inference requests and hands them to workers through a
@@ -19,15 +22,15 @@ import (
 var requestSeq atomic.Int64
 
 func runGateway(cfg config) {
-	pool := newRedisPool(cfg.RedisAddr)
+	rdb := newRedisClient(cfg.RedisAddr)
 
 	serveHTTP(cfg.Listen, func(mux *http.ServeMux) {
 		mux.HandleFunc("/infer", func(w http.ResponseWriter, r *http.Request) {
-			handleInfer(w, r, cfg, pool)
+			handleInfer(w, r, cfg, rdb)
 		})
 	})
 
-	go pollQueueDepth(cfg, pool)
+	go pollQueueDepth(cfg, rdb)
 
 	ready.Store(true)
 	log.Printf("gateway ready — queue=%s redis=%s timeout=%s",
@@ -35,35 +38,37 @@ func runGateway(cfg config) {
 	select {}
 }
 
-func handleInfer(w http.ResponseWriter, _ *http.Request, cfg config, pool *redisPool) {
+func handleInfer(w http.ResponseWriter, r *http.Request, cfg config, rdb *redis.Client) {
+	ctx := r.Context()
 	start := time.Now()
-	metricRequests.Add(1)
-	metricInflight.Add(1)
-	defer metricInflight.Add(-1)
+	metricRequests.Inc()
+	metricInflight.Inc()
+	defer metricInflight.Dec()
 
 	id := strconv.FormatInt(requestSeq.Add(1), 10) + "-" + strconv.FormatInt(start.UnixNano(), 10)
 
-	if err := pool.LPush(cfg.Queue, id); err != nil {
-		metricErrors.Add(1)
+	if err := rdb.LPush(ctx, cfg.Queue, id).Err(); err != nil {
+		metricErrors.Inc()
 		http.Error(w, "enqueue failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
 	// Block until a worker answers. Every second spent here is queue wait plus
 	// inference time, which is exactly the latency a user experiences.
-	reply, err := pool.BPop("BLPOP", "reply:"+id, cfg.RequestTimeout)
+	reply, err := blockingPop(ctx, rdb.BLPop, "reply:"+id, cfg.RequestTimeout)
 	elapsed := time.Since(start)
+	metricRequestSeconds.Observe(elapsed.Seconds())
 
 	switch {
 	case err != nil:
-		metricErrors.Add(1)
+		metricErrors.Inc()
 		http.Error(w, "reply wait failed: "+err.Error(), http.StatusBadGateway)
 	case reply == "":
-		metricTimeouts.Add(1)
-		metricErrors.Add(1)
+		metricTimeouts.Inc()
+		metricErrors.Inc()
 		http.Error(w, "timed out waiting for a worker", http.StatusGatewayTimeout)
 	case reply == "error":
-		metricErrors.Add(1)
+		metricErrors.Inc()
 		http.Error(w, "inference failed", http.StatusInternalServerError)
 	default:
 		w.WriteHeader(http.StatusOK)
@@ -73,10 +78,11 @@ func handleInfer(w http.ResponseWriter, _ *http.Request, cfg config, pool *redis
 
 // pollQueueDepth keeps mlsim_queue_depth fresh so the backlog is visible in
 // /metrics as well as in redis-cli.
-func pollQueueDepth(cfg config, pool *redisPool) {
+func pollQueueDepth(cfg config, rdb *redis.Client) {
+	ctx := context.Background()
 	for {
-		if n, err := pool.LLen(cfg.Queue); err == nil {
-			metricQueueDeep.Store(n)
+		if n, err := rdb.LLen(ctx, cfg.Queue).Result(); err == nil {
+			metricQueueDepth.Set(float64(n))
 		}
 		time.Sleep(5 * time.Second)
 	}
