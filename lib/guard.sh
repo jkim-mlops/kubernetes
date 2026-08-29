@@ -39,7 +39,10 @@ guard::require_lab_context() {
   fi
 }
 
-# Cluster name for a module directory: 01-scaling-beyond-hpa -> k8slab-01
+# Cluster name for a module directory: 01-scaling-beyond-hpa -> k8slab-01.
+# With no module (setup-only branches) the lab still gets a cluster of its own:
+# k8slab-base. Either way the name keeps the kind- prefix the guard demands.
 guard::cluster_for_module() {
-  printf '%s%s\n' "$LAB_CLUSTER_PREFIX" "${1%%-*}"
+  local module="${1:-base}"
+  printf '%s%s\n' "$LAB_CLUSTER_PREFIX" "${module%%-*}"
 }

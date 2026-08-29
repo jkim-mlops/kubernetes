@@ -49,6 +49,8 @@ things. Two independent protections, and neither may be weakened:
    which refuses to run unless the active context starts with `kind-k8slab-`.
 
 One kind cluster per module, named `k8slab-<NN>` (from the module directory's numeric prefix).
+A branch with no modules — `main` — still gets a cluster of its own, `k8slab-base`: the harness and
+the platform components are runnable on their own.
 
 ## Layout
 
@@ -140,17 +142,14 @@ task down | task clean
 
 ### Open, in order
 
-1. **Bug**: `lab up` hard-requires a module directory, so `main` alone is not runnable
-   (`task up` → `No such module`). Make the module optional: cluster + platform, module only if one
-   exists.
-2. **Setup review** — the owner has not yet ruled on four decisions:
+1. **Setup review** — the owner has not yet ruled on four decisions:
    - `mlsim` being stdlib-only (~200 lines of hand-rolled Redis/metrics code) vs. `go-redis` +
      `prometheus/client_golang`
    - the GPU plugin being a real gRPC device plugin (~200 lines) vs. a few lines that PATCH
      `nvidia.com/gpu` onto node status
    - KEDA installing at `task up` vs. being installed as part of solving scenario 01
    - Redis as the queue vs. something closer to their EKS stack (SQS via localstack, or Kafka)
-3. Design scenario 02, get approval, build, commit.
+2. Design scenario 02, get approval, build, commit.
 
 Planned module 1 arc after that: scale-to-zero and its cold start; scaling thrash under bursty
 load; right-sizing requests after an OOMKill; queueing batch work that does not fit. Then modules
