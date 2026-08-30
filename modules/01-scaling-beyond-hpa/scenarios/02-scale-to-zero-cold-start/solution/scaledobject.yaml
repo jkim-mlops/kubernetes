@@ -1,0 +1,32 @@
+# Scenario 01's ScaledObject, with the two fields that were inert while
+# minReplicaCount was above zero and become load-bearing the moment it is not.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 0
+  maxReplicaCount: 15
+
+  # How long the queue can hold work before KEDA even looks. The default is 30s,
+  # which is longer than most synchronous request timeouts -- so on defaults the
+  # first request after idle is already lost before the autoscaler has an
+  # opinion. This is the first term of the cold-start budget.
+  pollingInterval: 5
+
+  # How long a worker stays up after the last active poll. The default is 300s.
+  # Lower is cheaper and colder; higher is warmer and dearer. This is the dial
+  # that decides how often you pay a cold start at all, and it is the only
+  # honest place to make that trade.
+  cooldownPeriod: 60
+
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        listLength: "1"
+        activationListLength: "0"

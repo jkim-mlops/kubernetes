@@ -1,0 +1,179 @@
+# The same inference path as scenario 01, with two differences: the worker now
+# has a model to load before it can serve anything, and the ScaledObject is
+# allowed to go all the way to zero.
+#
+# Nothing in here is misconfigured. That is the point of this scenario.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference-gateway
+  template:
+    metadata:
+      labels:
+        app: inference-gateway
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: gateway
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            # Unchanged from scenario 01, where it was a sensible bound on how
+            # long a user should wait for an 800 ms inference.
+            - name: REQUEST_TIMEOUT
+              value: 20s
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  selector:
+    app: inference-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  # KEDA owns this number. Zero is the state the night leaves behind, and the
+  # state every morning starts from.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: model-worker
+  template:
+    metadata:
+      labels:
+        app: model-worker
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: worker
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            # Weights have to be read and the model placed on the device before
+            # this pod can serve anything. Twenty seconds is modest for a real
+            # one; sevens and eights of gigabytes take minutes.
+            - name: MODEL_LOAD_SECONDS
+              value: "20"
+            - name: LATENCY_MS
+              value: "800"
+            - name: CONCURRENCY
+              value: "1"
+            - name: CPU_BURN_MS
+              value: "15"
+          ports:
+            - containerPort: 8080
+          # /readyz stays 503 until the model is loaded, so a pod that is
+          # Running is not yet a pod that is working.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+# The accepted answer from scenario 01, with minReplicaCount dropped to zero.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 0
+  maxReplicaCount: 15
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        listLength: "1"
+        # Wake up for a single queued request. For inference that is what you
+        # want: there is no batch to wait for, so any work at all is worth a
+        # worker. (A threshold above zero belongs to workloads with genuine
+        # batch semantics, where processing 3 of 10 events is meaningless.)
+        activationListLength: "0"
+---
+# The morning trickle. Off by default: the reader turns it on to watch, and
+# verify.sh runs its own measured Job instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: ml
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: loadgen
+            - name: TARGET_URL
+              value: http://inference-gateway.ml.svc.cluster.local:8080/infer
+            - name: RPS
+              value: "1"
+            - name: DURATION
+              value: 24h
+            - name: REQUEST_TIMEOUT
+              value: 120s
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

@@ -151,6 +151,10 @@ task down | task clean
 - **`verify.sh` should clear the queue before measuring**, so the result depends on whether the
   system can serve its offered load rather than on how long the reader spent debugging.
 - **KEDA** warns that `pollingInterval` and `cooldownPeriod` are inert while `minReplicaCount > 0`.
+  They become load-bearing the moment it hits zero — which is scenario 02.
+- **KEDA activation fields are named per scaler**, not generically: `activationListLength` for Redis
+  lists, `activationLagThreshold` for Kafka. Default 0, compared *strictly* greater-than. Check the
+  scaler's own doc page rather than assuming `activationThreshold`.
 - **Not yet hit, but waiting**: the loadgen's `http.Client` uses the default transport, whose
   `MaxIdleConnsPerHost` is 2. At 12 rps with ~10 requests in flight most connections are closed
   rather than pooled — immaterial now, but a scenario that raises `RPS` into the hundreds would be
@@ -164,10 +168,17 @@ task down | task clean
   after the KEDA `ScaledObject`, p99 is 900ms with zero errors and the queue drains to 0.
   Re-validated from a fresh cluster after `main` merged in the go-redis/client_golang swap, which
   is what caught the two gateway traps above.
+  Scenario 02 "Scale to zero and the cold start" — validated end to end: from 0 replicas at 1 rps,
+  29 of 59 requests fail at exactly 20103ms (the gateway's `REQUEST_TIMEOUT`, reached before KEDA's
+  30s default `pollingInterval` has even looked at the queue); after `pollingInterval: 5`,
+  `cooldownPeriod: 60` and a 90s gateway timeout, 59/59 succeed with a 22.5s worst case and the
+  workers return to zero.
 
 ### Open, in order
 
-1. Design scenario 02, get approval, build, commit.
+1. Design scenario 03 — scaling thrash under bursty load. Scenario 02 deliberately tuned the
+   system to react fast and shed workers fast, which is exactly the configuration that thrashes
+   when load arrives in waves; its SOLUTION.md already points at this.
 
 Planned module 1 arc after that: scale-to-zero and its cold start; scaling thrash under bursty
 load; right-sizing requests after an OOMKill; queueing batch work that does not fit; and a Kafka
@@ -188,6 +199,11 @@ the queue underneath the earlier scenarios stays Redis. Then modules 02 extendin
   overlooked: `args: ["gateway"]` would be the more idiomatic shape — visible in the pod spec,
   validated at startup — but every other dial in mlsim is env, and scenarios inject faults by
   editing env. Revisit only if it actually bites.
+- **`activationListLength` above 0 belongs to batch workloads, not inference.** Rejected as the
+  basis for scenario 02: for serving, waking on a single request is correct, so a scenario built on
+  a non-zero activation threshold teaches a misconfiguration rather than a property of the system.
+  It has a real home in the batch/Kafka scenarios, where "these events must be processed together"
+  is an actual requirement.
 - **Redis stays the queue; no localstack.** Faking SQS would buy familiarity at the cost of faking
   IRSA / Pod Identity, which is the genuinely hard part on real EKS — false comfort is worse than
   an honest prop.
