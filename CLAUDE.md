@@ -48,6 +48,14 @@ things. Two independent protections, and neither may be weakened:
 2. `lib/guard.sh` is sourced by **every mutating script** and calls `guard::require_lab_context`,
    which refuses to run unless the active context starts with `kind-k8slab-`.
 
+**Both protections only cover code that goes through the Taskfile or `bin/lab`.** A bare `kubectl`
+typed into a shell reads `~/.kube/config` and talks to the real EKS cluster, guard or no guard —
+this has already happened once in a session, issuing `scale --replicas=0` against production, and
+was saved only by the endpoint not resolving. So: **never invoke `kubectl` directly in this repo.**
+Use `task k -- ...`, or `export KUBECONFIG="$PWD/.lab/kubeconfig"` first and confirm the context
+starts with `kind-k8slab-` before anything mutating. This applies to one-off diagnostic loops just
+as much as to scripts; those are exactly where the habit slips.
+
 One kind cluster per module, named `k8slab-<NN>` (from the module directory's numeric prefix).
 A branch with no modules — `main` — still gets a cluster of its own, `k8slab-base`: the harness and
 the platform components are runnable on their own.
@@ -152,6 +160,14 @@ task down | task clean
   system can serve its offered load rather than on how long the reader spent debugging.
 - **KEDA** warns that `pollingInterval` and `cooldownPeriod` are inert while `minReplicaCount > 0`.
   They become load-bearing the moment it hits zero — which is scenario 02.
+- **KEDA's scale-down is two stages with two owners**, and fixing one alone does nothing:
+  `N -> 0` is KEDA's and obeys `cooldownPeriod`; `N -> 1` is the HPA's and obeys
+  `behavior.scaleDown.stabilizationWindowSeconds` (which KEDA passes through). KEDA patches the
+  replica count straight to 0 regardless of what the HPA desires — observable as a Deployment at 0
+  whose HPA still reports `desiredReplicas: 15`. Upstream issue: kedacore/keda#7204.
+- **`.status.replicas` is omitted when it is zero.** `jsonpath='{.status.replicas}'` returns an
+  empty string, not `0`, so any counting of "was it scaled to zero" silently finds nothing. Default
+  it: `"${n:-0}"`. This produced a verify.sh that reported the opposite of the truth.
 - **KEDA activation fields are named per scaler**, not generically: `activationListLength` for Redis
   lists, `activationLagThreshold` for Kafka. Default 0, compared *strictly* greater-than. Check the
   scaler's own doc page rather than assuming `activationThreshold`.
@@ -173,12 +189,15 @@ task down | task clean
   30s default `pollingInterval` has even looked at the queue); after `pollingInterval: 5`,
   `cooldownPeriod: 60` and a 90s gateway timeout, 59/59 succeed with a 22.5s worst case and the
   workers return to zero.
+  Scenario 03 "Thrashing on bursty load" — validated end to end: 6 rps in 90s waves, measured on the
+  second wave only. Before, p50 18903ms / p99 39252ms with 55s of the run at zero workers; after
+  `cooldownPeriod: 300` **and** an HPA `stabilizationWindowSeconds: 300`, p50 807ms / p99 901ms with
+  no rebuild.
 
 ### Open, in order
 
-1. Design scenario 03 — scaling thrash under bursty load. Scenario 02 deliberately tuned the
-   system to react fast and shed workers fast, which is exactly the configuration that thrashes
-   when load arrives in waves; its SOLUTION.md already points at this.
+1. Design scenario 04 — right-sizing after an OOMKill. Every worker so far runs a memory request
+   nobody measured; scenario 03's SOLUTION.md already points at it.
 
 Planned module 1 arc after that: scale-to-zero and its cold start; scaling thrash under bursty
 load; right-sizing requests after an OOMKill; queueing batch work that does not fit; and a Kafka

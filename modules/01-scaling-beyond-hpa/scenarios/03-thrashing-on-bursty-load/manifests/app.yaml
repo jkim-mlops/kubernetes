@@ -1,0 +1,177 @@
+# The system exactly as scenario 02 left it, with one difference: traffic now
+# arrives in waves instead of a trickle.
+#
+# The ScaledObject below is scenario 02's answer, unchanged. It is not wrong.
+# It encodes an assumption about the shape of the traffic, and the shape changed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference-gateway
+  template:
+    metadata:
+      labels:
+        app: inference-gateway
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: gateway
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            # Raised in scenario 02 so a request could outlive a cold start.
+            # It still does, which is why nobody is seeing errors this time.
+            - name: REQUEST_TIMEOUT
+              value: 90s
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  selector:
+    app: inference-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: model-worker
+  template:
+    metadata:
+      labels:
+        app: model-worker
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: worker
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            - name: MODEL_LOAD_SECONDS
+              value: "20"
+            - name: LATENCY_MS
+              value: "800"
+            - name: CONCURRENCY
+              value: "1"
+            - name: CPU_BURN_MS
+              value: "15"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+# Scenario 02's fix, shipped and working. Read it as the answer to the last
+# problem, not as the cause of this one -- both of these numbers were chosen
+# for a good reason and neither has been touched since.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 0
+  maxReplicaCount: 15
+  pollingInterval: 5
+  cooldownPeriod: 60
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        listLength: "1"
+        activationListLength: "0"
+---
+# The wave. Off by default; verify.sh runs its own measured Job, and the reader
+# turns this on to watch the shape.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: ml
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: loadgen
+            - name: TARGET_URL
+              value: http://inference-gateway.ml.svc.cluster.local:8080/infer
+            - name: PROFILE
+              value: burst
+            # 90s of traffic, then 90s of silence, repeating.
+            - name: BURST_PERIOD
+              value: 90s
+            - name: RPS
+              value: "6"
+            - name: DURATION
+              value: 24h
+            - name: REQUEST_TIMEOUT
+              value: 120s
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

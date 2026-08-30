@@ -1,0 +1,49 @@
+# The fix is entirely in the time constants, and the reasoning behind each one
+# matters more than the number.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 0
+  maxReplicaCount: 15
+  pollingInterval: 5
+
+  # THE FIX. The gap between waves is ~90s. At cooldownPeriod: 60 the workers
+  # were torn down inside every lull and rebuilt -- 20s of model load -- for
+  # every wave. 300s outlasts the lull, so the workers survive from one wave to
+  # the next, and still go to zero on a genuinely idle night.
+  #
+  # The rule this encodes: cooldownPeriod must exceed the gaps you intend to
+  # sit through, and stay below the gaps you intend to scale to zero for. If no
+  # such value exists, your traffic has no idle periods worth the cold start,
+  # and scale-to-zero is costing you more than it saves.
+  cooldownPeriod: 300
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # The SECOND half of the fix, and the half that is easy to get
+          # backwards. KEDA feeds this straight to the HPA, and the HPA governs
+          # 1<->N only -- it has no bearing on the transition to zero. So this
+          # alone fixes nothing. But cooldownPeriod alone fixes nothing either:
+          # stop KEDA jumping to zero and the HPA will still scale 15 -> 1
+          # across the lull, and the next wave rebuilds from 1.
+          #
+          # It must outlast the lull plus however long the queue takes to
+          # drain -- about 135s here. The Kubernetes default is 300s, which is
+          # why leaving it alone works and why setting it to something
+          # "reasonable" like 120 actively breaks it.
+          stabilizationWindowSeconds: 300
+
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        listLength: "1"
+        activationListLength: "0"
