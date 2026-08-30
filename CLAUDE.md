@@ -151,6 +151,10 @@ task down | task clean
 - **`verify.sh` should clear the queue before measuring**, so the result depends on whether the
   system can serve its offered load rather than on how long the reader spent debugging.
 - **KEDA** warns that `pollingInterval` and `cooldownPeriod` are inert while `minReplicaCount > 0`.
+- **Not yet hit, but waiting**: the loadgen's `http.Client` uses the default transport, whose
+  `MaxIdleConnsPerHost` is 2. At 12 rps with ~10 requests in flight most connections are closed
+  rather than pooled — immaterial now, but a scenario that raises `RPS` into the hundreds would be
+  measuring TCP handshakes and billing them to the gateway. Set it explicitly before that happens.
 
 ## Current state
 
