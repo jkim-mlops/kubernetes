@@ -1,0 +1,30 @@
+# Right-sized from measurement, not from the gateway's manifest.
+#
+#   kubectl -n ml top pod -l app=model-worker
+#   NAME                            CPU(cores)   MEMORY(bytes)
+#   model-worker-...                18m          437Mi
+#
+# 400MB of weights plus the Go runtime lands around 437Mi, so 256Mi was never
+# survivable and 512Mi would leave nothing for a bad day.
+#
+# requests == limits puts this pod in the Guaranteed QoS class. For a workload
+# whose footprint is a known model size rather than a guess, that is the honest
+# setting: it tells the scheduler the truth, and it puts the pod last in line
+# when a node comes under pressure. The gateway can stay Burstable -- it holds
+# no model and its usage really is bursty.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  template:
+    spec:
+      containers:
+        - name: mlsim
+          resources:
+            requests:
+              memory: 768Mi
+              cpu: 100m
+            limits:
+              memory: 768Mi

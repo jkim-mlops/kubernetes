@@ -143,5 +143,6 @@ recovery once one is being paid.
 ## Next
 
 Right-sizing. Every worker in this module has been running with a memory request
-nobody measured, on the assumption that model weights are small. They are not,
-and the pod that gets OOMKilled will not be the one you expect.
+nobody measured, copied from a manifest for a process that holds no model. The
+autoscaler you have spent three scenarios tuning is about to multiply that
+mistake by fifteen.

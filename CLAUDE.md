@@ -165,6 +165,8 @@ task down | task clean
   `behavior.scaleDown.stabilizationWindowSeconds` (which KEDA passes through). KEDA patches the
   replica count straight to 0 regardless of what the HPA desires — observable as a Deployment at 0
   whose HPA still reports `desiredReplicas: 15`. Upstream issue: kedacore/keda#7204.
+- **`.status.readyReplicas` and `.status.replicas` are both omitted when zero**, so
+  `jsonpath` yields an empty string rather than `0`. Default every such read with `"${n:-0}"`.
 - **`.status.replicas` is omitted when it is zero.** `jsonpath='{.status.replicas}'` returns an
   empty string, not `0`, so any counting of "was it scaled to zero" silently finds nothing. Default
   it: `"${n:-0}"`. This produced a verify.sh that reported the opposite of the truth.
@@ -193,11 +195,20 @@ task down | task clean
   second wave only. Before, p50 18903ms / p99 39252ms with 55s of the run at zero workers; after
   `cooldownPeriod: 300` **and** an HPA `stabilizationWindowSeconds: 300`, p50 807ms / p99 901ms with
   no rebuild.
+  Scenario 04 "Fifteen replicas, none ready" — validated end to end: a 400MB model under a 256Mi
+  limit gives 0 ready of 15, 68 restarts, 15 OOMKilled and 719/719 failed requests; sized at
+  768Mi requests==limits (Guaranteed QoS) it is 15/15 ready, zero restarts, p99 901ms.
 
 ### Open, in order
 
-1. Design scenario 04 — right-sizing after an OOMKill. Every worker so far runs a memory request
-   nobody measured; scenario 03's SOLUTION.md already points at it.
+1. **Measurement bug in `loadgen`**: `results.record` tests `recording` at request *completion*,
+   so warm-up requests that finish after the warm-up window are counted in the measured set. It
+   only shows up when latency is high — scenario 04's broken run reports `requests=719` for a 60s
+   window at 6 rps. No pass/fail outcome changes (the affected runs fail regardless), but the
+   failure-side numbers quoted in SOLUTION.md files are inflated. Fix: capture `recording` at send
+   time and pass it into `record`. Requires re-validating all four scenarios and refreshing the
+   quoted numbers.
+2. Design scenario 05 — batch work that does not fit, then the Kafka consumer-lag scenario.
 
 Planned module 1 arc after that: scale-to-zero and its cold start; scaling thrash under bursty
 load; right-sizing requests after an OOMKill; queueing batch work that does not fit; and a Kafka

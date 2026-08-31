@@ -1,0 +1,173 @@
+# The system as scenarios 01-03 left it, with one change from outside this
+# module entirely: the model got bigger.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference-gateway
+  template:
+    metadata:
+      labels:
+        app: inference-gateway
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: gateway
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            - name: REQUEST_TIMEOUT
+              value: 90s
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway
+  namespace: ml
+spec:
+  selector:
+    app: inference-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: model-worker
+  template:
+    metadata:
+      labels:
+        app: model-worker
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: worker
+            - name: REDIS_ADDR
+              value: redis.ml.svc.cluster.local:6379
+            - name: QUEUE_NAME
+              value: infer:queue
+            - name: MODEL_LOAD_SECONDS
+              value: "20"
+            # The new weights. This is the only line that changed, and it was
+            # changed by someone who does not own this manifest.
+            - name: MEM_PER_MODEL_MB
+              value: "400"
+            - name: LATENCY_MS
+              value: "800"
+            - name: CONCURRENCY
+              value: "1"
+            - name: CPU_BURN_MS
+              value: "15"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          # Copied from the gateway when this Deployment was first written, and
+          # never revisited. The gateway holds no model.
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-worker
+  namespace: ml
+spec:
+  scaleTargetRef:
+    name: model-worker
+  minReplicaCount: 0
+  maxReplicaCount: 15
+  pollingInterval: 5
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.ml.svc.cluster.local:6379
+        listName: infer:queue
+        listLength: "1"
+        activationListLength: "0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: ml
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: mlsim
+          image: k8slab/mlsim:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: loadgen
+            - name: TARGET_URL
+              value: http://inference-gateway.ml.svc.cluster.local:8080/infer
+            - name: RPS
+              value: "6"
+            - name: DURATION
+              value: 24h
+            - name: REQUEST_TIMEOUT
+              value: 120s
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
